@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: anniemusic-youtube-api
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: DOWNLOAD_WORKERS
+        value: "100"
+      # Optional: set COOKIES_FILE=/etc/secrets/cookies.txt
+      # and upload cookies.txt as a Render secret file.
