@@ -5,8 +5,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg aria2 curl ca-certificates nodejs \
+    ffmpeg aria2 curl ca-certificates unzip \
     && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://deno.land/install.sh | sh
+
+ENV PATH="/root/.deno/bin:${PATH}"
 
 WORKDIR /app
 
