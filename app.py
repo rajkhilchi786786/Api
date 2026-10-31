@@ -68,10 +68,11 @@ YTDLP_COMMON = [
     "10M",
 ]
 
-# Optional Render secret file; cookies are not required.
-if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
-    YTDLP_COMMON += ["--cookies", COOKIES_FILE]
 
+if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
+    RUNTIME_COOKIES = "/tmp/annie_cookies.txt"
+    shutil.copy2(COOKIES_FILE, RUNTIME_COOKIES)
+    YTDLP_COMMON += ["--cookies", RUNTIME_COOKIES]
 
 # =========================================================
 # UTIL
