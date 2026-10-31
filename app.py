@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException, Header, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Header, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 import asyncio
 import os
 import time
@@ -23,7 +23,7 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 # Keep this reasonable.
 # 1000 simultaneous downloads can overload the VPS/network.
-DOWNLOAD_WORKERS = asyncio.Semaphore(int(os.getenv("DOWNLOAD_WORKERS", "100")))
+DOWNLOAD_WORKERS = asyncio.Semaphore(max(1, int(os.getenv("DOWNLOAD_WORKERS", "10"))))
 
 ACTIVE_DOWNLOADS: Dict[str, asyncio.Lock] = {}
 
@@ -62,17 +62,20 @@ YTDLP_COMMON = [
     "3",
 
     "--buffer-size",
-    "16K",
-
-    "--http-chunk-size",
-    "10M",
+    "1M",
 ]
 
-
+# Optional Render secret file; cookies are not required.
 if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
-    RUNTIME_COOKIES = "/tmp/annie_cookies.txt"
-    shutil.copy2(COOKIES_FILE, RUNTIME_COOKIES)
-    YTDLP_COMMON += ["--cookies", RUNTIME_COOKIES]
+    try:
+        RUNTIME_COOKIES = os.path.join(CACHE_DIR, "runtime_cookies.txt")
+        if os.path.abspath(COOKIES_FILE) != os.path.abspath(RUNTIME_COOKIES):
+            shutil.copy2(COOKIES_FILE, RUNTIME_COOKIES)
+        YTDLP_COMMON += ["--cookies", RUNTIME_COOKIES]
+        print("🍪 Cookies loaded", flush=True)
+    except Exception as e:
+        log(f"⚠️ Cookies could not be copied: {e}")
+
 
 # =========================================================
 # UTIL
@@ -596,14 +599,16 @@ async def download_audio(video_id: str):
 
     file_path = (
         f"{CACHE_DIR}/"
-        f"{video_id}.m4a"
+        f"{video_id}.audio.m4a"
     )
 
     # -----------------------------------------------------
     # FILE CACHE
     # -----------------------------------------------------
 
-    if os.path.exists(file_path):
+    cached_audio = glob.glob(f"{CACHE_DIR}/{video_id}.audio.*")
+    if cached_audio:
+        file_path = cached_audio[0]
 
         RAM_CACHE["audio"][video_id] = (
             file_path
@@ -639,11 +644,19 @@ async def download_audio(video_id: str):
         cmd = [
             "yt-dlp", *YTDLP_COMMON,
             "--no-part", "--no-continue",
-            "--fragment-retries", "5",
-            "-f", "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+            "--fragment-retries", "3",
+            "-f", "bestaudio[ext=m4a]/bestaudio",
             "-o", temp,
-            f"https://youtu.be/{video_id}",
         ]
+        # Optional aria2c acceleration for direct HTTP audio formats.
+        # Moderate concurrency avoids unnecessarily aggravating YouTube 429 limits.
+        if shutil.which("aria2c"):
+            cmd += [
+                "--external-downloader", "aria2c",
+                "--external-downloader-args",
+                "aria2c:-x 4 -s 4 -k 1M --summary-interval=0",
+            ]
+        cmd.append(f"https://youtu.be/{video_id}")
         ok = await run_cmd(cmd)
         files = glob.glob(f"{CACHE_DIR}/{video_id}_temp.*")
         valid_files = [f for f in files if os.path.isfile(f) and os.path.getsize(f) > 0]
@@ -651,6 +664,8 @@ async def download_audio(video_id: str):
         if ok and valid_files:
             source = max(valid_files, key=os.path.getsize)
             try:
+                source_ext = os.path.splitext(source)[1].lower() or ".m4a"
+                file_path = f"{CACHE_DIR}/{video_id}.audio{source_ext}"
                 if os.path.exists(file_path):
                     os.remove(file_path)
                 shutil.move(source, file_path)
@@ -753,7 +768,7 @@ async def download_video(video_id: str):
             "--no-part", "--no-continue",
             "--concurrent-fragments", "8",
             "--fragment-retries", "5",
-            "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+            "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]",
             "--merge-output-format", "mp4",
             "-o", temp,
             f"https://youtu.be/{video_id}",
@@ -855,6 +870,68 @@ async def download(
 
 
 # =========================================================
+# INLINE MEDIA RESPONSE WITH HTTP RANGE SUPPORT
+# =========================================================
+
+def media_range_response(request: Request, path: str, media_type: str, filename: str):
+    file_size = os.path.getsize(path)
+    range_header = request.headers.get("range")
+    start, end = 0, file_size - 1
+    status_code = 200
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": f'inline; filename="{filename}"',
+        "Cache-Control": "public, max-age=3600",
+    }
+
+    if range_header:
+        match = re.match(r"bytes=(\\d*)-(\\d*)$", range_header.strip())
+        if not match:
+            raise HTTPException(status_code=416, detail="Invalid byte range",
+                                headers={"Content-Range": f"bytes */{file_size}"})
+        first, last = match.groups()
+        if first == "" and last == "":
+            raise HTTPException(status_code=416, detail="Invalid byte range",
+                                headers={"Content-Range": f"bytes */{file_size}"})
+        if first == "":
+            length = int(last)
+            if length <= 0:
+                raise HTTPException(status_code=416, detail="Invalid byte range",
+                                    headers={"Content-Range": f"bytes */{file_size}"})
+            start = max(0, file_size - length)
+        else:
+            start = int(first)
+            end = int(last) if last else file_size - 1
+        if start >= file_size or end < start:
+            raise HTTPException(status_code=416, detail="Range not satisfiable",
+                                headers={"Content-Range": f"bytes */{file_size}"})
+        end = min(end, file_size - 1)
+        status_code = 206
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+
+    content_length = end - start + 1
+    headers["Content-Length"] = str(content_length)
+
+    async def file_iterator():
+        with open(path, "rb") as media_file:
+            media_file.seek(start)
+            remaining = content_length
+            while remaining > 0:
+                chunk = media_file.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    return StreamingResponse(
+        file_iterator(),
+        status_code=status_code,
+        media_type=media_type,
+        headers=headers,
+    )
+
+
+# =========================================================
 # STREAM
 # =========================================================
 
@@ -862,6 +939,7 @@ async def download(
     "/stream/{video_id}"
 )
 async def stream(
+    request: Request,
     video_id: str,
     type: str,
     token: Optional[str] = Query(None),
@@ -952,11 +1030,12 @@ async def stream(
             detail="Download failed"
         )
 
-    return FileResponse(
-        path,
-        media_type=media_type,
-        filename=filename
-    )
+    # Inline disposition allows browser playback; byte ranges allow seeking.
+    if type == "audio":
+        ext = os.path.splitext(path)[1].lower()
+        media_type = "audio/mp4" if ext == ".m4a" else "audio/webm"
+        filename = f"{video_id}{ext}"
+    return media_range_response(request, path, media_type, filename)
 
 
 # =========================================================
@@ -1023,16 +1102,18 @@ async def clear_cache():
 
     try:
 
-        for f in glob.glob(
-            f"{CACHE_DIR}/*_info.json"
-        ):
-
+        patterns = (
+            glob.glob(f"{CACHE_DIR}/*_info.json")
+            + glob.glob(f"{CACHE_DIR}/*.audio.*")
+            + glob.glob(f"{CACHE_DIR}/*.mp4")
+            + glob.glob(f"{CACHE_DIR}/*_temp*")
+        )
+        for f in set(patterns):
             try:
-
-                os.remove(f)
-
-            except Exception:
-                pass
+                if os.path.isfile(f):
+                    os.remove(f)
+            except Exception as e:
+                log(f"⚠️ Cache remove failed: {f}: {e}")
 
     except Exception:
         pass
