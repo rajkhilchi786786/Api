@@ -885,7 +885,7 @@ def media_range_response(request: Request, path: str, media_type: str, filename:
     }
 
     if range_header:
-        match = re.match(r"bytes=(\\d*)-(\\d*)$", range_header.strip())
+        match = re.match(r"bytes=(\d*)-(\d*)$", range_header.strip())
         if not match:
             raise HTTPException(status_code=416, detail="Invalid byte range",
                                 headers={"Content-Range": f"bytes */{file_size}"})
