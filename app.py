@@ -8,7 +8,6 @@ import re
 import glob
 import secrets
 import json
-import urllib.request
 from typing import Dict, Optional
 
 app = FastAPI()
@@ -235,6 +234,70 @@ async def run_cmd(cmd):
         )
 
     return process.returncode == 0
+
+
+async def run_audio_cmd(cmd, started):
+    """Run yt-dlp and measure extraction, first progress, and total time."""
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    first_output = None
+    first_progress = None
+    saw_429 = False
+    error_lines = []
+
+    while True:
+        raw = await process.stderr.readline()
+        if not raw:
+            break
+
+        line = raw.decode(errors="ignore").strip()
+        if not line:
+            continue
+
+        elapsed = time.perf_counter() - started
+
+        if first_output is None:
+            first_output = elapsed
+            log(f"⏱️ Audio yt-dlp first output: {elapsed:.2f}s")
+
+        if "429" in line or "Too Many Requests" in line:
+            if not saw_429:
+                log(f"⚠️ Audio YouTube 429 at {elapsed:.2f}s")
+            saw_429 = True
+
+        if first_progress is None and re.search(r"\d+(?:\.\d+)?% of", line):
+            first_progress = elapsed
+            log(f"⚡ Audio first download progress: {elapsed:.2f}s")
+
+        if "ERROR:" in line or "WARNING:" in line:
+            error_lines.append(line)
+            if len(error_lines) > 12:
+                error_lines.pop(0)
+
+    return_code = await process.wait()
+    total = time.perf_counter() - started
+
+    if first_output is None:
+        log(f"⏱️ Audio yt-dlp produced no output | {total:.2f}s")
+
+    if first_progress is None:
+        log(f"⚠️ Audio progress never started | total {total:.2f}s")
+
+    if error_lines:
+        for line in error_lines:
+            log(f"yt-dlp: {line}")
+
+    log(
+        f"📊 Audio stages: first_output={first_output if first_output is not None else -1:.2f}s | "
+        f"first_progress={first_progress if first_progress is not None else -1:.2f}s | "
+        f"process_total={total:.2f}s | 429={saw_429}"
+    )
+
+    return return_code == 0
 
 
 def calc_speed(size_mb, seconds):
@@ -613,16 +676,16 @@ async def download_audio(video_id: str):
             "yt-dlp", *YTDLP_COMMON,
             "--no-part",
             "--no-continue",
-            "--concurrent-fragments", "8",
-            "--fragment-retries", "5",
-            "--retries", "5",
-            "--retry-sleep", "http:1",
+            "--newline",
+            "--progress",
+            "--retries", "2",
+            "--fragment-retries", "2",
             "-f", "bestaudio[ext=m4a]/bestaudio",
             "-o", temp,
             f"https://youtu.be/{video_id}",
         ]
 
-        ok = await run_cmd(cmd)
+        ok = await run_audio_cmd(cmd, time.perf_counter())
         files = [
             p for p in glob.glob(f"{CACHE_DIR}/{video_id}_temp.*")
             if os.path.isfile(p) and os.path.getsize(p) > 0
@@ -1090,58 +1153,6 @@ async def clear_cache():
         "status": "success",
         "message": "All cache cleared"
     })
-
-
-# =========================================================
-# RENDER NETWORK SPEED TEST
-# =========================================================
-
-def _run_network_speed_test():
-    """Measure outbound download speed from the Render instance."""
-    test_url = "https://speed.cloudflare.com/__down?bytes=25000000"
-    started = time.time()
-    total_bytes = 0
-
-    request = urllib.request.Request(
-        test_url,
-        headers={"User-Agent": "ANNIEMUSIC-Network-Test/1.0"},
-    )
-
-    with urllib.request.urlopen(request, timeout=60) as response:
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            total_bytes += len(chunk)
-
-    elapsed = max(time.time() - started, 0.001)
-    size_mb = total_bytes / (1024 * 1024)
-
-    return {
-        "status": "success",
-        "size_mb": round(size_mb, 2),
-        "time_seconds": round(elapsed, 2),
-        "speed_MB_s": round(size_mb / elapsed, 2),
-        "speed_Mbps": round((total_bytes * 8) / elapsed / 1_000_000, 2),
-        "source": "Cloudflare speed test",
-    }
-
-
-@app.get("/network-test")
-async def network_test():
-    """
-    Test outbound network speed from the Render server.
-    This downloads up to 25 MB and does not write a file to disk.
-    """
-    try:
-        result = await asyncio.to_thread(_run_network_speed_test)
-        return result
-    except Exception as e:
-        log(f"\u26a0\ufe0f Network test failed: {e}")
-        raise HTTPException(
-            status_code=502,
-            detail=f"Network speed test failed: {str(e)[:200]}",
-        )
 
 
 # =========================================================
