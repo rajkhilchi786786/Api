@@ -8,6 +8,7 @@ import re
 import glob
 import secrets
 import json
+import urllib.request
 from typing import Dict, Optional
 
 app = FastAPI()
@@ -1089,6 +1090,58 @@ async def clear_cache():
         "status": "success",
         "message": "All cache cleared"
     })
+
+
+# =========================================================
+# RENDER NETWORK SPEED TEST
+# =========================================================
+
+def _run_network_speed_test():
+    """Measure outbound download speed from the Render instance."""
+    test_url = "https://speed.cloudflare.com/__down?bytes=25000000"
+    started = time.time()
+    total_bytes = 0
+
+    request = urllib.request.Request(
+        test_url,
+        headers={"User-Agent": "ANNIEMUSIC-Network-Test/1.0"},
+    )
+
+    with urllib.request.urlopen(request, timeout=60) as response:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+
+    elapsed = max(time.time() - started, 0.001)
+    size_mb = total_bytes / (1024 * 1024)
+
+    return {
+        "status": "success",
+        "size_mb": round(size_mb, 2),
+        "time_seconds": round(elapsed, 2),
+        "speed_MB_s": round(size_mb / elapsed, 2),
+        "speed_Mbps": round((total_bytes * 8) / elapsed / 1_000_000, 2),
+        "source": "Cloudflare speed test",
+    }
+
+
+@app.get("/network-test")
+async def network_test():
+    """
+    Test outbound network speed from the Render server.
+    This downloads up to 25 MB and does not write a file to disk.
+    """
+    try:
+        result = await asyncio.to_thread(_run_network_speed_test)
+        return result
+    except Exception as e:
+        log(f"\u26a0\ufe0f Network test failed: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Network speed test failed: {str(e)[:200]}",
+        )
 
 
 # =========================================================
