@@ -12,6 +12,12 @@ from typing import Dict, Optional
 
 app = FastAPI()
 
+
+def log(msg):
+    print(msg, flush=True)
+
+
+
 # =========================================================
 # CONFIG
 # =========================================================
@@ -80,10 +86,6 @@ if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
 # =========================================================
 # UTIL
 # =========================================================
-
-def log(msg):
-    print(msg, flush=True)
-
 
 def extract_video_id(text: str):
 
@@ -572,123 +574,84 @@ async def get_video_info(video_id: str):
 # =========================================================
 
 async def download_audio(video_id: str):
-
-    # -----------------------------------------------------
-    # RAM CACHE
-    # -----------------------------------------------------
-
+    """Download audio using yt-dlp's native downloader."""
     if video_id in RAM_CACHE["audio"]:
-
         path = RAM_CACHE["audio"][video_id]
-
-        if os.path.exists(path):
-
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
             return path
+        RAM_CACHE["audio"].pop(video_id, None)
 
-        RAM_CACHE["audio"].pop(
-            video_id,
-            None
-        )
-
-    start = time.time()
-
-    log(
-        f"🎵 Audio download request: "
-        f"{video_id}"
-    )
-
-    file_path = (
-        f"{CACHE_DIR}/"
-        f"{video_id}.audio.m4a"
-    )
-
-    # -----------------------------------------------------
-    # FILE CACHE
-    # -----------------------------------------------------
-
-    cached_audio = glob.glob(f"{CACHE_DIR}/{video_id}.audio.*")
+    cached_audio = [
+        p for p in glob.glob(f"{CACHE_DIR}/{video_id}.audio.*")
+        if os.path.isfile(p) and os.path.getsize(p) > 0
+    ]
     if cached_audio:
-        file_path = cached_audio[0]
-
-        RAM_CACHE["audio"][video_id] = (
-            file_path
-        )
-
-        size = (
-            os.path.getsize(
-                file_path
-            )
-            / 1024
-            / 1024
-        )
-
-        log(
-            f"⚡ Audio cache hit: "
-            f"{size:.2f}MB"
-        )
-
+        file_path = max(cached_audio, key=os.path.getsize)
+        RAM_CACHE["audio"][video_id] = file_path
+        size = os.path.getsize(file_path) / (1024 * 1024)
+        log(f"⚡ Audio cache hit: {size:.2f}MB")
         return file_path
 
     async with DOWNLOAD_WORKERS:
+        # Re-check cache after waiting for a worker slot.
+        cached_audio = [
+            p for p in glob.glob(f"{CACHE_DIR}/{video_id}.audio.*")
+            if os.path.isfile(p) and os.path.getsize(p) > 0
+        ]
+        if cached_audio:
+            file_path = max(cached_audio, key=os.path.getsize)
+            RAM_CACHE["audio"][video_id] = file_path
+            return file_path
 
-        temp = (
-            f"{CACHE_DIR}/"
-            f"{video_id}_temp.%(ext)s"
-        )
+        started = time.time()
+        log(f"🎵 Audio download request: {video_id}")
+        temp = f"{CACHE_DIR}/{video_id}_temp.%(ext)s"
+        cleanup_temp_files(video_id)
 
-        cleanup_temp_files(
-            video_id
-        )
-
-        # Direct Render download (proxy removed).
         cmd = [
             "yt-dlp", *YTDLP_COMMON,
-            "--no-part", "--no-continue",
-            "--fragment-retries", "3",
+            "--no-part",
+            "--no-continue",
+            "--concurrent-fragments", "8",
+            "--fragment-retries", "5",
+            "--retries", "5",
+            "--retry-sleep", "http:1",
             "-f", "bestaudio[ext=m4a]/bestaudio",
             "-o", temp,
+            f"https://youtu.be/{video_id}",
         ]
-        # Optional aria2c acceleration for direct HTTP audio formats.
-        # Moderate concurrency avoids unnecessarily aggravating YouTube 429 limits.
-        if shutil.which("aria2c"):
-            cmd += [
-                "--external-downloader", "aria2c",
-                "--external-downloader-args",
-                "aria2c:-x 4 -s 4 -k 1M --summary-interval=0",
-            ]
-        cmd.append(f"https://youtu.be/{video_id}")
-        ok = await run_cmd(cmd)
-        files = glob.glob(f"{CACHE_DIR}/{video_id}_temp.*")
-        valid_files = [f for f in files if os.path.isfile(f) and os.path.getsize(f) > 0]
 
-        if ok and valid_files:
-            source = max(valid_files, key=os.path.getsize)
+        ok = await run_cmd(cmd)
+        files = [
+            p for p in glob.glob(f"{CACHE_DIR}/{video_id}_temp.*")
+            if os.path.isfile(p) and os.path.getsize(p) > 0
+        ]
+
+        if ok and files:
+            source = max(files, key=os.path.getsize)
+            ext = os.path.splitext(source)[1].lower() or ".m4a"
+            file_path = f"{CACHE_DIR}/{video_id}.audio{ext}"
             try:
-                source_ext = os.path.splitext(source)[1].lower() or ".m4a"
-                file_path = f"{CACHE_DIR}/{video_id}.audio{source_ext}"
                 if os.path.exists(file_path):
                     os.remove(file_path)
                 shutil.move(source, file_path)
-            except Exception as e:
-                log(f"❌ Audio move failed: {e}")
+            except Exception as exc:
+                log(f"❌ Audio move failed: {exc}")
                 cleanup_temp_files(video_id)
                 return None
 
             RAM_CACHE["audio"][video_id] = file_path
-            size = os.path.getsize(file_path) / 1024 / 1024
-            total = time.time() - start
-            log(f"✅ Audio success: {size:.2f}MB | {total:.2f}s | {calc_speed(size, total)}")
+            size = os.path.getsize(file_path) / (1024 * 1024)
+            elapsed = max(time.time() - started, 0.001)
+            log(
+                f"✅ Audio success: {size:.2f}MB | "
+                f"{elapsed:.2f}s | {calc_speed(size, elapsed)}"
+            )
             return file_path
 
         cleanup_temp_files(video_id)
         log(f"❌ Direct audio download failed: {video_id}")
-
-    log(
-        f"❌ Audio failed: "
-        f"{video_id}"
-    )
-
-    return None
+        return None
 
 
 # =========================================================
@@ -875,6 +838,8 @@ async def download(
 
 def media_range_response(request: Request, path: str, media_type: str, filename: str):
     file_size = os.path.getsize(path)
+    if file_size <= 0:
+        raise HTTPException(status_code=404, detail="Media file is empty")
     range_header = request.headers.get("range")
     start, end = 0, file_size - 1
     status_code = 200
@@ -1106,6 +1071,8 @@ async def clear_cache():
             glob.glob(f"{CACHE_DIR}/*_info.json")
             + glob.glob(f"{CACHE_DIR}/*.audio.*")
             + glob.glob(f"{CACHE_DIR}/*.mp4")
+            + glob.glob(f"{CACHE_DIR}/*.mkv")
+            + glob.glob(f"{CACHE_DIR}/*.webm")
             + glob.glob(f"{CACHE_DIR}/*_temp*")
         )
         for f in set(patterns):
@@ -1137,5 +1104,5 @@ async def root():
 
     return JSONResponse({
         "Status":
-            "ANNIEMUSIC YouTube API Running on Render ✅"
+            "ANNIEMUSIC YouTube API Running on ✅"
     })
